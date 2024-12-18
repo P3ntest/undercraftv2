@@ -1,6 +1,7 @@
 import * as PIXI from "pixi.js";
-import { Engine, Composite, Bodies, Runner, Render } from "matter-js";
+import Matter, { Engine, Composite, Bodies, Runner, Render } from "matter-js";
 import { Ticker } from "./Ticker";
+import { Player } from "./player";
 
 export const CHUNK_SIZE = 10;
 export const BLOCK_SIZE = 20;
@@ -9,6 +10,7 @@ export class World {
   private chunks: Chunk[][] = [];
   private worldContainer = new PIXI.Container();
   private entities: Entity[] = [];
+  private player: Player | null = null;
 
   matterEngine = Engine.create();
 
@@ -17,29 +19,45 @@ export class World {
   });
 
   tick(delta: number) {
+    for (const entity of this.entities) {
+      entity.onUpdate();
+    }
+
+    for (const entity of this.entities) {
+      entity._syncTransformToPhysics();
+    }
+
     Engine.update(this.matterEngine, delta);
     for (const entity of this.entities) {
-      entity.syncPhysics();
+      entity._syncPhysicsToTransform();
+    }
+
+    if (this.player) {
+      // move world to center on player
+      this.worldContainer.x = -this.player.transform.x + window.innerWidth / 4;
+      this.worldContainer.y = -this.player.transform.y + window.innerHeight / 4;
     }
   }
 
   constructor() {
     const sky = new PIXI.Graphics();
     sky.beginFill(0x00ffff);
-    sky.drawRect(0, 0, 2000, 2000);
+    const skySize = 1000000;
+    sky.drawRect(-skySize, -skySize, 2 * skySize, 2 * skySize);
     this.worldContainer.addChild(sky);
 
     this.worldContainer.interactive = true;
     this.worldContainer.eventMode = "static";
 
     this.worldContainer.on("pointerdown", (event) => {
+      const pos = event.getLocalPosition(this.worldContainer);
       if (event.altKey) {
-        this.spawnEntityAt(event.data.global.x, event.data.global.y);
+        this.spawnEntityAt(pos.x, pos.y);
         return;
       }
 
-      const x = Math.floor((event.data.global.x + BLOCK_SIZE / 2) / BLOCK_SIZE);
-      const y = Math.floor((event.data.global.y + BLOCK_SIZE / 2) / BLOCK_SIZE);
+      const x = Math.floor((pos.x + BLOCK_SIZE / 2) / BLOCK_SIZE);
+      const y = Math.floor((pos.y + BLOCK_SIZE / 2) / BLOCK_SIZE);
 
       if (this.getBlockAt(x, y)) {
         this.setBlockAt(x, y, null);
@@ -59,14 +77,24 @@ export class World {
     Render.run(renderer);
   }
 
-  spawnEntityAt(x: number, y: number) {
-    const entity = new Entity(this);
-    entity.transform.x = x;
-    entity.transform.y = y;
+  spawnEntity(entity: Entity) {
     entity.renderPhysics();
     const sprite = entity.render();
     this.worldContainer.addChild(sprite);
     this.entities.push(entity);
+    entity.onSpawn();
+  }
+
+  setPlayer(player: Player) {
+    this.player = player;
+    this.spawnEntity(player);
+  }
+
+  spawnEntityAt(x: number, y: number) {
+    const entity = new Entity(this);
+    entity.transform.x = x;
+    entity.transform.y = y;
+    this.spawnEntity(entity);
   }
 
   render() {
@@ -157,20 +185,27 @@ class Batch {
 
     for (let x = 0; x < CHUNK_SIZE; x++) {
       for (let y = 0; y < CHUNK_SIZE; y++) {
-        if (this.mask[x][y]) {
-          const body = Bodies.rectangle(
-            x * BLOCK_SIZE + chunkOffset.x,
-            y * BLOCK_SIZE + chunkOffset.y,
-            BLOCK_SIZE,
-            BLOCK_SIZE,
-            {
-              isStatic: true,
-            }
-          );
-          this.matterBodies.push(body);
+        if (!this.mask[x][y]) {
+          continue;
         }
+        const body = Bodies.rectangle(
+          chunkOffset.x + x * BLOCK_SIZE,
+          chunkOffset.y + y * BLOCK_SIZE,
+          BLOCK_SIZE,
+          BLOCK_SIZE,
+          {
+            isStatic: true,
+          }
+        );
+        this.matterBodies.push(body);
       }
     }
+
+    // const body = Bodies.fromVertices(chunkOffset.x, chunkOffset.y, [points], {
+    //   isStatic: true,
+    // });
+
+    // this.matterBodies.push(body);
 
     Composite.add(this.chunk.world.matterEngine.world, this.matterBodies);
     console.log("rendering physics");
@@ -185,17 +220,17 @@ class Chunk {
     this.renderInstance = new PIXI.Container();
     this.renderInstance.x = x * CHUNK_SIZE * BLOCK_SIZE;
     this.renderInstance.y = y * CHUNK_SIZE * BLOCK_SIZE;
-    const chunkBorders = new PIXI.Graphics();
-    chunkBorders.lineStyle(1, 0x000000);
-    // chunkBorders.beginFill(0x000000);
+    // const chunkBorders = new PIXI.Graphics();
+    // chunkBorders.lineStyle(1, 0x000000);
+    // // chunkBorders.beginFill(0x000000);
 
-    chunkBorders.drawRect(
-      0 - BLOCK_SIZE / 2,
-      0 - BLOCK_SIZE / 2,
-      CHUNK_SIZE * BLOCK_SIZE,
-      CHUNK_SIZE * BLOCK_SIZE
-    );
-    this.renderInstance.addChild(chunkBorders);
+    // chunkBorders.drawRect(
+    //   0 - BLOCK_SIZE / 2,
+    //   0 - BLOCK_SIZE / 2,
+    //   CHUNK_SIZE * BLOCK_SIZE,
+    //   CHUNK_SIZE * BLOCK_SIZE
+    // );
+    // this.renderInstance.addChild(chunkBorders);
   }
 
   private blocks: (Block | null)[][];
@@ -258,10 +293,12 @@ class Chunk {
     }
     this.recalculateBatches = false;
     // batches all blocks that are connected to each other
-    for (const batch of this.batches) {
-      batch.onUmount();
-    }
-    this.batches = [];
+    // for (const batch of this.batches) {
+    //   batch.onUmount();
+    // }
+    // this.batches = [];
+
+    let masks: BatchMask[] = [];
 
     for (let x = 0; x < CHUNK_SIZE; x++) {
       for (let y = 0; y < CHUNK_SIZE; y++) {
@@ -269,7 +306,7 @@ class Chunk {
         if (!block) {
           continue;
         }
-        const neighbouringPositions = [
+        const neighboringPositions = [
           [x - 1, y],
           [x + 1, y],
           [x, y - 1],
@@ -277,31 +314,48 @@ class Chunk {
         ].filter(([x, y]) => {
           return x >= 0 && x < CHUNK_SIZE && y >= 0 && y < CHUNK_SIZE;
         });
-        const batches = this.batches.filter((batch) => {
-          return neighbouringPositions.some(([x, y]) => batch.mask[x][y]);
+        const connectedMasks = masks.filter((mask) => {
+          return neighboringPositions.some(([x, y]) => mask[x][y]);
         });
-        if (batches.length === 0) {
-          const batch = new Batch(
-            this,
-            createEmptyBatchMask(),
-            Math.floor(Math.random() * 0xffffff)
-          );
-          batch.mask[x][y] = true;
-          this.batches.push(batch);
-        } else if (batches.length === 1) {
-          batches[0].mask[x][y] = true;
+        if (connectedMasks.length === 0) {
+          const mask = createEmptyBatchMask();
+          mask[x][y] = true;
+          masks.push(mask);
+        } else if (connectedMasks.length === 1) {
+          connectedMasks[0][x][y] = true;
         } else {
-          const mergedBatch = mergeBatches(batches);
-          mergedBatch.mask[x][y] = true;
-          this.batches = this.batches.filter(
-            (batch) => !batches.includes(batch)
-          );
-          this.batches.push(mergedBatch);
+          const mergedBatch = mergeMasks(connectedMasks);
+          mergedBatch[x][y] = true;
+          masks = masks.filter((mask) => {
+            return !connectedMasks.includes(mask);
+          });
+          masks.push(mergedBatch);
         }
       }
     }
 
-    this.batches.forEach((batch) => {
+    this.batches = this.batches.filter((batch) => {
+      if (masks.some((mask) => compareMasks(mask, batch.mask))) {
+        return true;
+      } else {
+        batch.onUmount();
+        return false;
+      }
+    });
+
+    const changedBatches: Batch[] = [];
+
+    for (const mask of masks) {
+      if (this.batches.some((batch) => compareMasks(mask, batch.mask))) {
+        continue;
+      }
+      const color = Math.floor(Math.random() * 0xffffff);
+      const batch = new Batch(this, mask, color);
+      changedBatches.push(batch);
+      this.batches.push(batch);
+    }
+
+    changedBatches.forEach((batch) => {
       batch.renderPhysics();
     });
   }
@@ -322,20 +376,24 @@ function createEmptyBatchMask(): BatchMask {
     .map(() => new Array(CHUNK_SIZE).fill(false));
 }
 
-function mergeBatches(batches: Batch[]): Batch {
-  const result = new Batch(
-    batches[0].chunk,
-    createEmptyBatchMask(),
-    batches[0].color
-  );
-  batches.forEach((batch) => {
-    batch.mask.forEach((row, x) => {
+function mergeMasks(masks: BatchMask[]): BatchMask {
+  const result = createEmptyBatchMask();
+  masks.forEach((mask) => {
+    mask.forEach((row, x) => {
       row.forEach((value, y) => {
-        result.mask[x][y] = result.mask[x][y] || value;
+        result[x][y] = result[x][y] || value;
       });
     });
   });
   return result;
+}
+
+function compareMasks(a: BatchMask, b: BatchMask): boolean {
+  return a.every((row, x) => {
+    return row.every((value, y) => {
+      return value === b[x][y];
+    });
+  });
 }
 
 class Transform {
@@ -344,12 +402,15 @@ class Transform {
   rotation = 0;
 }
 
-class Entity {
+export class Entity {
   sprite = new PIXI.Container();
 
   transform = new Transform();
 
-  constructor(private world: World) {}
+  constructor(public world: World) {}
+
+  onSpawn() {}
+  onUpdate() {}
 
   render() {
     const graphics = new PIXI.Graphics();
@@ -361,7 +422,20 @@ class Entity {
     return this.sprite;
   }
 
-  syncPhysics() {
+  _syncTransformToPhysics() {
+    // this.physicsBody!.position.x = this.transform.x;
+    // this.physicsBody!.position.y = this.transform.y;
+    // this.physicsBody!.angle = this.transform.rotation;
+
+    Matter.Body.setPosition(this.physicsBody!, {
+      x: this.transform.x,
+      y: this.transform.y,
+    });
+    console.log(this.transform.x);
+    Matter.Body.setAngle(this.physicsBody!, this.transform.rotation);
+  }
+
+  _syncPhysicsToTransform() {
     this.transform.x = this.physicsBody!.position.x;
     this.transform.y = this.physicsBody!.position.y;
     this.transform.rotation = this.physicsBody!.angle;
@@ -371,7 +445,7 @@ class Entity {
     this.sprite.rotation = this.transform.rotation;
   }
 
-  physicsBody: Matter.Body | null = null;
+  physicsBody!: Matter.Body;
   renderPhysics() {
     const body = Bodies.rectangle(
       this.transform.x,
